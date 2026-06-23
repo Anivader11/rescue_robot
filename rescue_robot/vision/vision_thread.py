@@ -27,8 +27,8 @@ from control.shared_vision import SharedVision
 log = logging.getLogger(__name__)
 
 # Which CSI port each camera is on
-LINE_CAM = 0   # downward facing — line following
-FWD_CAM  = 1   # forward facing  — obstacle detection
+LINE_CAM = 1   # downward facing — line following
+FWD_CAM  = 0   # forward facing  — obstacle detection
 
 FRAME_WIDTH  = 640
 FRAME_HEIGHT = 480
