@@ -125,7 +125,7 @@ class BLDCMotorDriver(MotorDriver):
         try:
             import board
             import busio
-            from steelbar_circuitpython_powerful_bldc_driver import PowerfulBLDCDriver
+            from steelbar_powerful_bldc_driver import PowerfulBLDCDriver
             self._driver_cls = PowerfulBLDCDriver
         except ImportError as e:
             raise RuntimeError(
