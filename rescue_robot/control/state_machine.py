@@ -171,17 +171,18 @@ class StateMachine:
         else:
             self.motors.rotate_left(SEARCH_ROTATE_SPEED)
 
-    def _state_intersection(self, v):
-        self.motors.stop()
-        if v.green_marker:
-            self._marker_turn_dir   = -1.0
-            self._marker_turn_start = time.monotonic()
-            self._transition(RobotState.MARKER_TURN)
-            log.info("[INTERSECTION] Green marker → turn left")
-        else:
-            self.pid.reset()
-            self._transition(RobotState.LINE_FOLLOWING)
-            log.info("[INTERSECTION] No marker → straight")
+def _state_intersection(self, v):
+    self.motors.stop()
+    if v.green_marker:
+        self._marker_turn_dir = 1.0 if v.green_marker_x > 0 else -1.0
+        direction = "right" if self._marker_turn_dir > 0 else "left"
+        self._marker_turn_start = time.monotonic()
+        self._transition(RobotState.MARKER_TURN)
+        log.info(f"[INTERSECTION] Green marker at x={v.green_marker_x:+.2f} → turn {direction}")
+    else:
+        self.pid.reset()
+        self._transition(RobotState.LINE_FOLLOWING)
+        log.info("[INTERSECTION] No marker → straight")
 
     def _state_marker_turn(self, v):
         elapsed = time.monotonic() - self._marker_turn_start
