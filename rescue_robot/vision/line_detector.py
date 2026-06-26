@@ -60,9 +60,14 @@ class LineResult:
     line_width_px:  float = 0.0
     intersection:   bool  = False
     green_marker:   bool  = False
+    green_marker_x: float = 0.0
     spill_tape:     bool  = False
     last_error:     float = 0.0
     debug_frame:    Optional[np.ndarray] = field(default=None, repr=False)
+    green_marker:   bool  = False
+    green_marker_x: float = 0.0    # normalised centre x of marker
+    debug_frame:    Optional[np.ndarray] = field(default=None, repr=False)
+
 
 
 # ---------------------------------------------------------------------------
@@ -115,13 +120,13 @@ class LineDetector:
         h, w = frame.shape[:2]
         debug_frame = frame.copy() if self.debug else None
         binary      = self._threshold(frame)
-        green_marker = self._detect_green_marker(frame, debug_frame)
+        green_marker, green_marker_x = self._detect_green_marker(frame, debug_frame)
         spill_tape   = self._detect_spill_tape(frame, debug_frame)
         near = self._analyse_roi(binary, ROI_NEAR, w, h, debug_frame, (0, 255, 0))
         mid  = self._analyse_roi(binary, ROI_MID,  w, h, debug_frame, (0, 200, 255))
         far  = self._analyse_roi(binary, ROI_FAR,  w, h, debug_frame, (255, 150, 0))
         intersection = self._detect_intersection(binary, ROI_MID, w, h, debug_frame)
-        return self._build_result(near, mid, far, intersection, green_marker, spill_tape, w, debug_frame)
+        return self._build_result(near, mid, far, intersection, green_marker, green_marker_x, spill_tape, w, debug_frame)
 
     def _threshold(self, frame):
         lab  = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
@@ -189,23 +194,26 @@ class LineDetector:
     def _detect_green_marker(self, frame, debug_frame):
         hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv,
-                           (GREEN_H_LOW, GREEN_S_LOW, GREEN_V_LOW),
-                           (GREEN_H_HIGH, GREEN_S_HIGH, GREEN_V_HIGH))
-        h = mask.shape[0]
+                       (GREEN_H_LOW, GREEN_S_LOW, GREEN_V_LOW),
+                       (GREEN_H_HIGH, GREEN_S_HIGH, GREEN_V_HIGH))
+        h, w = mask.shape
         mask[h // 2:, :] = 0
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < GREEN_MIN_AREA_PX:
                 continue
-            x, y, w, hh = cv2.boundingRect(cnt)
-            if 0.4 < (w / max(hh, 1)) < 2.5:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            if 0.4 < (cw / max(ch, 1)) < 2.5:
+            # Normalise centre x: -1 = far left, +1 = far right
+                marker_cx = x + cw / 2
+                marker_x_norm = (marker_cx - w / 2) / (w / 2)
                 if self.debug and debug_frame is not None:
-                    cv2.rectangle(debug_frame, (x, y), (x+w, y+hh), (0, 200, 0), 2)
-                    cv2.putText(debug_frame, "GREEN MARKER", (x, y-5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 2)
-                return True
-        return False
+                    cv2.rectangle(debug_frame, (x, y), (x+cw, y+ch), (0, 200, 0), 2)
+                    cv2.putText(debug_frame, f"MARKER x={marker_x_norm:+.2f}",
+                            (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 2)
+            return True, marker_x_norm
+        return False, 0.0
 
     def _detect_spill_tape(self, frame, debug_frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -222,7 +230,7 @@ class LineDetector:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         return detected
 
-    def _build_result(self, near, mid, far, intersection, green_marker, spill_tape, frame_w, debug_frame):
+    def _build_result(self, near, mid, far, intersection, green_marker, green_marker_x, spill_tape, frame_w, debug_frame):
         half_w = frame_w / 2
 
         def norm_error(r):
@@ -234,6 +242,7 @@ class LineDetector:
             return LineResult(state=LineState.ENTERING_SPILL, error=self._last_error,
                               error_px=self._last_error*half_w, confidence=1.0,
                               intersection=False, green_marker=green_marker,
+                              green_marker_x=green_marker_x,
                               spill_tape=True, last_error=self._last_error,
                               debug_frame=debug_frame)
 
@@ -249,6 +258,7 @@ class LineDetector:
             return LineResult(state=state, error=error_norm, error_px=error_px,
                               confidence=near["confidence"], line_width_px=near["width_px"],
                               intersection=intersection, green_marker=green_marker,
+                              green_marker_x=green_marker_x,
                               spill_tape=False, last_error=self._last_error,
                               debug_frame=debug_frame)
 
@@ -264,6 +274,7 @@ class LineDetector:
                               confidence=recovery["confidence"]*0.6,
                               line_width_px=recovery["width_px"],
                               intersection=intersection, green_marker=green_marker,
+                              green_marker_x=green_marker_x,
                               spill_tape=False, last_error=self._last_error,
                               debug_frame=debug_frame)
 
@@ -279,5 +290,6 @@ class LineDetector:
         return LineResult(state=state, error=self._last_error,
                           error_px=self._last_error*half_w, confidence=0.0,
                           intersection=False, green_marker=green_marker,
+                          green_marker_x=green_marker_x,
                           spill_tape=False, last_error=self._last_error,
                           debug_frame=debug_frame)
