@@ -5,6 +5,7 @@ Thread-safe container that vision threads write to and the control loop reads fr
 """
 import threading
 from dataclasses import dataclass, field
+from unittest import result
 from vision.line_detector import LineState
 
 @dataclass
@@ -19,6 +20,8 @@ class SharedVision:
     last_valid_error:     float     = 0.0
     obstacle_detected:    bool      = False
     obstacle_distance_cm: float     = 999.0
+    green_marker:     bool  = False
+    green_marker_x:   float = 0.0    # normalised -1..1, negative=left, positive=right
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def update_line(self, result) -> None:
@@ -31,6 +34,8 @@ class SharedVision:
             self.green_marker     = result.green_marker
             self.spill_tape       = result.spill_tape
             self.last_valid_error = result.last_error
+            self.green_marker   = result.green_marker
+            self.green_marker_x = result.green_marker_x
 
     def update_forward(self, obstacle: bool, distance_cm: float) -> None:
         with self.lock:
@@ -50,4 +55,6 @@ class SharedVision:
                 last_valid_error     = self.last_valid_error,
                 obstacle_detected    = self.obstacle_detected,
                 obstacle_distance_cm = self.obstacle_distance_cm,
+                green_marker   = self.green_marker,
+                green_marker_x = self.green_marker_x,
             )
