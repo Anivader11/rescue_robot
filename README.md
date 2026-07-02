@@ -26,8 +26,8 @@ python3 main.py --stub --no-cam
 
 ## How It Works
 Three threads run concurrently:
-- **Line camera thread** — captures 30 fps from CAM0, detects the black line, intersection markers, green markers and spill tape
-- **Forward camera thread** — captures 15 fps from CAM1, detects obstacles and estimates distance
+- **Line camera thread** — captures 30 fps from CAM1, detects the black line, intersection markers, green markers and spill tape
+- **Forward camera thread** — captures 15 fps from CAM0, detects obstacles and estimates distance
 - **Control loop** — runs at 50 Hz, reads vision data, runs PID controller, sends speed commands to all four motors over I2C
 
 ## Tests
