@@ -58,4 +58,4 @@ Key values to tune on the floor before competition in `state_machine.py`:
 
 And in `motors.py`:
 - `LEFT_INVERTED` / `RIGHT_INVERTED` — flip if wheels spin backwards
-- `BASE_SPEED_UNITS` — motor speed in BLDC units
+- `BASE_SPEED_UNITS` — motor speed in BLDC units (conversion from bldc to rpm 275251.2 bldc = 1 rpm )
