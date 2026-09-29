@@ -1,0 +1,26 @@
+{
+  "LEFT_FRONT": {
+    "address": 32,
+    "elec_angle_offset": 1166513920,
+    "sincos_centre": 1236,
+    "source": "test_forwardv2.py — confirmed working straight-line drive"
+  },
+  "LEFT_REAR": {
+    "address": 27,
+    "elec_angle_offset": 1185746176,
+    "sincos_centre": 1237,
+    "source": "test_forwardv2.py — confirmed working straight-line drive"
+  },
+  "RIGHT_FRONT": {
+    "address": 25,
+    "elec_angle_offset": 1540904960,
+    "sincos_centre": 1250,
+    "source": "test_forwardv2.py — confirmed working straight-line drive"
+  },
+  "RIGHT_REAR": {
+    "address": 26,
+    "elec_angle_offset": 2142859264,
+    "sincos_centre": 980,
+    "source": "test_forwardv2.py — confirmed working straight-line drive"
+  }
+}
