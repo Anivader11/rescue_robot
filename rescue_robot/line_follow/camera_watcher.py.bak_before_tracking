@@ -1,0 +1,239 @@
+"""
+camera_watcher.py
+===================
+Single shared background camera thread that both green-marker detection
+and spill/silver-tape detection run on top of. Only ONE physical camera
+exists on the robot, so green_detector.py and spill_detector.py can't
+each open their own Picamera2 instance at the same time -- this replaces
+both with one thread that grabs a frame once per tick and runs both
+checks on that same frame.
+
+Usage (same shape as the old GreenDetector/SpillDetector):
+    watcher = CameraWatcher()
+    watcher.start()
+    ...
+    side, seen_at = watcher.get_green()      # "left"/"right"/None, timestamp
+    seen, seen_at = watcher.get_spill()       # True/False, timestamp
+    frame, seen_at = watcher.get_frame()      # latest raw BGR frame, for
+                                               # on-demand checks like
+                                               # bottle_detector.py
+    ...
+    watcher.stop()
+"""
+
+import os
+import time
+import threading
+import logging
+
+import cv2
+import numpy as np
+
+from spill_classifier import extract_features, predict_silver
+
+log = logging.getLogger(__name__)
+
+CAM_INDEX = 0
+
+# Image orientation fixes, applied to every frame straight after capture (so
+# green side, bottle check, endzone vision etc. all see the corrected image).
+MIRROR_LEFT_RIGHT = True    # flip the picture left<->right (camera image was mirrored)
+FLIP_UP_DOWN = False        # flip the picture top<->bottom
+FRAME_WIDTH = 320
+FRAME_HEIGHT = 240
+FPS = 24
+
+# --- Green marker settings (from green_detector.py) ---
+MIN_GREEN_AREA = 300
+
+# --- Green side relative to the BLACK LINE (not the frame centre) ---
+BLACK_V_MAX = 70            # pixel darker than this (HSV V) = black line
+LINE_COL_MIN_FRAC = 0.5     # a column counts as "the line" if >= this fraction of the
+                            # rows level with the green square are black there
+                            # (filters out the horizontal crossing line)
+GREEN_H_LOW,  GREEN_H_HIGH  = 38,  85
+GREEN_S_LOW,  GREEN_S_HIGH  = 60, 255
+GREEN_V_LOW,  GREEN_V_HIGH  = 40, 255
+
+# --- Spill/silver tape settings (from spill_detector.py) ---
+SPILL_BOX_SIZE = 150            # same box size used during sample collection/training
+SPILL_MIN_CONFIDENCE = 0.7       # only count it as "seen" above this confidence
+
+
+class CameraWatcher:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._green_side = None
+        self._green_seen_at = 0.0
+        self._green_debug = (None, None)   # (green_cx, line_x) of last detection
+        self._spill_seen = False
+        self._spill_seen_at = 0.0
+        self._frame = None
+        self._frame_seen_at = 0.0
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def get_green(self):
+        with self._lock:
+            return self._green_side, self._green_seen_at
+
+    def get_green_debug(self):
+        """(green_cx, line_x) pixel positions from the last green detection."""
+        with self._lock:
+            return self._green_debug
+
+    def get_spill(self):
+        with self._lock:
+            return self._spill_seen, self._spill_seen_at
+
+    def get_frame(self):
+        """Returns (frame, seen_at) for the most recent captured frame --
+        a copy, safe to hand to on-demand checks like bottle_detector.py
+        without racing the capture thread. (None, 0.0) if nothing captured
+        yet."""
+        with self._lock:
+            if self._frame is None:
+                return None, 0.0
+            return self._frame.copy(), self._frame_seen_at
+
+    def _check_green(self, frame, half_w):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(
+            hsv,
+            (GREEN_H_LOW, GREEN_S_LOW, GREEN_V_LOW),
+            (GREEN_H_HIGH, GREEN_S_HIGH, GREEN_V_HIGH)
+        )
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best = None
+        best_area = 0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < MIN_GREEN_AREA or area <= best_area:
+                continue
+            best_area = area
+            best = cnt
+
+        if best is not None:
+            M = cv2.moments(best)
+            cx = M["m10"] / M["m00"] if M["m00"] > 0 else half_w
+            x, y, w, h = cv2.boundingRect(best)
+
+            # Find the black line in the rows level with the green square and
+            # decide left/right relative to IT, not the middle of the picture.
+            line_x = self._line_x_near(hsv, mask, y, h, cx)
+            ref_x = line_x if line_x is not None else half_w
+            side = "right" if cx > ref_x else "left"
+            with self._lock:
+                self._green_side = side
+                self._green_seen_at = time.monotonic()
+                self._green_debug = (int(cx), None if line_x is None else int(line_x))
+        else:
+            # No green contour this frame -- revert to None instead of
+            # leaving the last detected side stuck forever.
+            with self._lock:
+                self._green_side = None
+
+    @staticmethod
+    def _line_x_near(hsv, green_mask, y, h, green_cx):
+        """x position of the black line in the band of rows level with the
+        green square, or None if no line found there. Uses the middle 60% of
+        the square's rows so the horizontal crossing line (just above/below
+        the square) mostly drops out; then only keeps columns that are black
+        for most of the band (a vertical line), and picks the run of such
+        columns closest to the green square."""
+        y0 = y + int(h * 0.2)
+        y1 = max(y0 + 1, y + int(h * 0.8))
+        band = hsv[y0:y1]
+        black = cv2.inRange(band, (0, 0, 0), (180, 255, BLACK_V_MAX))
+        black[green_mask[y0:y1] > 0] = 0
+        frac = (black > 0).mean(axis=0)              # fraction of band rows black, per column
+        cols = np.where(frac >= LINE_COL_MIN_FRAC)[0]
+        if cols.size == 0:
+            return None
+        # split into contiguous runs, take the run nearest the green square
+        runs = np.split(cols, np.where(np.diff(cols) > 2)[0] + 1)
+        centres = [r.mean() for r in runs]
+        return min(centres, key=lambda c: abs(c - green_cx))
+
+    def _check_spill(self, frame, box):
+        x1, y1, x2, y2 = box
+        roi = frame[y1:y2, x1:x2]
+        feats = extract_features(roi)
+        is_silver, confidence = predict_silver(feats)
+
+        seen = is_silver and confidence >= SPILL_MIN_CONFIDENCE
+        with self._lock:
+            self._spill_seen = seen
+            if seen:
+                self._spill_seen_at = time.monotonic()
+
+    def _loop(self):
+        try:
+            from picamera2 import Picamera2
+        except ImportError:
+            log.error("picamera2 not installed. Run: sudo apt install python3-picamera2 -y")
+            return
+
+        cam = Picamera2(CAM_INDEX)
+        config = cam.create_preview_configuration(
+            main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "BGR888"},
+            controls={"FrameRate": FPS}
+        )
+        cam.configure(config)
+        cam.start()
+        log.info("[camera-watcher] camera started on CAM%d", CAM_INDEX)
+
+        half_w = FRAME_WIDTH / 2
+
+        cx, cy = FRAME_WIDTH // 2, FRAME_HEIGHT // 2
+        half = SPILL_BOX_SIZE // 2
+        spill_box = (
+            max(0, cx - half), max(0, cy - half),
+            min(FRAME_WIDTH, cx + half), min(FRAME_HEIGHT, cy + half),
+        )
+
+        while self._running:
+            frame = cam.capture_array()
+            if MIRROR_LEFT_RIGHT and FLIP_UP_DOWN:
+                frame = cv2.flip(frame, -1)
+            elif MIRROR_LEFT_RIGHT:
+                frame = cv2.flip(frame, 1)
+            elif FLIP_UP_DOWN:
+                frame = cv2.flip(frame, 0)
+            self._check_green(frame, half_w)
+            self._check_spill(frame, spill_box)
+            with self._lock:
+                self._frame = frame
+                self._frame_seen_at = time.monotonic()
+            time.sleep(1.0 / FPS)
+
+        cam.stop()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    w = CameraWatcher()
+    w.start()
+    try:
+        while True:
+            side, g_at = w.get_green()
+            seen, s_at = w.get_spill()
+            frame, _ = w.get_frame()
+            if frame is not None:
+                cv2.imwrite(os.path.expanduser("~/cam_check.jpg"), frame)
+            gx, lx = w.get_green_debug()
+            print(f"green_side={side} (green_x={gx}, line_x={lx}) spill_seen={seen}")
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        w.stop()

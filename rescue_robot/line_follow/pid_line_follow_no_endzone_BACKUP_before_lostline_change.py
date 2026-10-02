@@ -1,0 +1,442 @@
+"""
+pid_line_follow_no_endzone.py
+==============================
+Same as pid_line_follow.py (8-sensor PID, turn memory, corner routine,
+green markers, ToF + camera obstacle evasion, ramp speed boost) but with
+NO silver-tape detection handling and NO evacuation-zone logic -- the
+robot just keeps line following.
+
+(camera_watcher.py still runs its silver classifier in the background
+because it's built into the shared camera thread -- this file never
+reads it, so it can't stop the robot.)
+
+Sensor power: the line sensor board has an EN (enable) pin -- BCM22 --
+that must be driven HIGH before the OUT pins will report anything
+real. Without this, the sensors are simply unpowered.
+
+Sensor pins are claimed with an internal pull-up (lgpio.SET_PULL_UP) --
+this is the exact setup confirmed working in sensor_tests/test_line.py.
+WHITE -> LOW (0), BLACK -> HIGH (1).
+
+Sensors: all 8 outputs of the Parallax #28034 array are read (see
+SENSOR_PINS). The line's position is the average weight of the sensors
+on black (-3.5..+3.5) and feeds the PID. All 8 white = line lost: if it
+was last seen off to one side the robot keeps turning that way (turn
+memory); if it was last near the middle it's treated as a gap and the
+robot drives straight. 6+ sensors on black = junction -> straight.
+
+Green marker handling:
+    The shared camera thread (camera_watcher.py) watches for a green
+    marker off to one side. When seen, the robot ignores the line
+    sensors for a short fixed turn, then resumes normal PID following.
+
+Obstacle handling:
+    A background thread (tof_detector.py) polls the SteelBar ToF
+    distance sensor (tof_sensor.py). The ToF alone can't tell a ramp
+    apart from an actual obstacle -- both can read within
+    OBSTACLE_TRIGGER_MM -- so as soon as it triggers, the robot grabs
+    the latest camera frame (from the shared camera_watcher.py thread)
+    and runs bottle_detector.py's shape check on it before doing
+    anything. Only if that confirms it looks like the bottle (not a
+    flat/angled ramp surface) does it run the fixed timed evasion
+    maneuver (obstacle_evade.py: back, right, forward, left, straight,
+    left, right). If the camera doesn't confirm it, it's treated as a
+    ramp and the ToF trigger is ignored -- normal line following (with
+    the accelerometer ramp speed boost below) just continues.
+
+Ramp/IMU handling:
+    A background thread (accel_speed_boost.py) polls the BNO085's raw
+    Y acceleration (imu_sensor.py). Whenever Y drops below
+    ACCEL_Y_BOOST_THRESHOLD (-15 m/s^2 by default -- flat/level sits
+    around -9.8 from gravity, so this fires once the robot noses
+    upward enough on a ramp), BASE_SPEED is scaled up by
+    ACCEL_SPEED_BOOST_MULTIPLIER. Returns to normal speed the instant
+    Y comes back above the threshold.
+"""
+
+import time
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import lgpio
+from control.motors import BLDCMotorDriver
+from camera_watcher import CameraWatcher
+from tof_detector import ToFDetector
+from obstacle_evade import run_evade_sequence
+from bottle_detector import is_bottle
+from accel_speed_boost import AccelSpeedBoost
+from camera_servo import CameraServo
+
+EN_PIN = 22    # line sensor array's enable line -- must be driven HIGH or the sensors don't power up at all
+
+# --- 8-sensor array (Parallax #28034), wiring confirmed with sensor_tests/test_line8.py ---
+#              OUT0 OUT1 OUT2 OUT3 OUT4 OUT5 OUT6 OUT7
+SENSOR_PINS = [5,   6,   24,  16,  17,  23,  25,  26]
+
+# Position weight per sensor. Sign chosen to match the old, confirmed-working
+# 2-sensor code: OUT2 (old left pin, BCM24) on black gave a POSITIVE error,
+# OUT5 (old right pin, BCM23) a NEGATIVE one -- so the OUT0 end is positive.
+# If the robot steers AWAY from the line, flip LINE_SIGN to -1.
+LINE_SIGN = 1
+WEIGHTS = [3.5, 2.5, 1.5, 0.5, -0.5, -1.5, -2.5, -3.5]
+
+# --- Line lost: turn ON THE SPOT toward the last left/right turn ---
+LOST_TURN_SPEED = 25.0           # spin speed while searching (one wheel +, other -)
+TURN_DIR_MIN_CORRECTION = 10.0   # correction at least this big counts as turning left/right
+
+# --- Slow down in sharp turns (U-turn hairpins, tight bends) ---
+SLOWDOWN_START_ERR = 1.0   # line this far off centre (or less) -> full speed
+SLOWDOWN_FULL_ERR = 3.0    # line this far off centre (or lost) -> slowest
+MIN_SPEED_FRAC = 0.35      # slowest = this fraction of BASE_SPEED (30 -> ~10)
+JUNCTION_MIN_BLACK = 6     # this many+ sensors on black = junction / wide black -> go straight
+
+# --- Sharp 90-degree corner straight after a long straight -------------------
+# (e.g. the top-right corner of the double-corner tile, where the robot used to
+# spin on the spot 5 cm short of the corner and U-turn back down the line).
+# Only fires when the robot HAD been driving straight for CORNER_MIN_STRAIGHT_S
+# and then half the array suddenly goes black on ONE side. Everything else
+# (curves, corners that come straight after another turn) is normal PID.
+CORNER_ENABLED = True
+CORNER_MIN_STRAIGHT_S = 0.4   # must have been straight (|error| <= 1) this long first
+CORNER_MIN_BLACK = 4          # 4+ black incl. one END sensor (other end white) = corner
+CORNER_FORWARD_SPEED = 30.0
+CORNER_FORWARD_S = 0.25       # TUNE: drive on this long so the wheels reach the corner (~5 cm)
+CORNER_PIVOT_SPEED = 45.0
+CORNER_PIVOT_MIN_S = 0.1
+CORNER_PIVOT_TIMEOUT_S = 2.0
+
+BASE_SPEED = 30.0
+Kp = 15.0   # tuned on the robot
+Kd = 15.0
+
+GREEN_STOP_S = 1.0           # after seeing green: stop completely this long,
+GREEN_FORWARD_S = 0.4        # ...then drive straight this long (TUNE: higher = turns later),
+GREEN_FORWARD_SPEED = 30.0   # ...THEN do the turn
+GREEN_TURN_DURATION_S = 0.6
+GREEN_TURN_SPEED = 30.0
+GREEN_SWAP_TURN = False      # set True if it says 'turning left' but physically spins right
+GREEN_COOLDOWN_S = 0.8   # was 2.0 -- too long, skipped the 2nd square straight after a turn
+
+
+# --- Obstacle (ToF) tunables ---
+SET_CAMERA_ANGLE = False      # False = don't touch the camera at start; set its angle BY HAND before running
+USE_TOF = False               # False = ToF obstacle check off (no evasion at all)
+OBSTACLE_TRIGGER_MM = 50
+OBSTACLE_STALE_S = 0.5           # ignore ToF readings older than this (sensor stuck/disconnected)
+OBSTACLE_COOLDOWN_S = 1.0        # after an evade (or a ramp false-alarm), ignore new triggers briefly
+OBSTACLE_CAMERA_SETTLE_S = 0.4  # wait after raising the camera so the next frame is from the new angle
+OBSTACLE_FRAME_STALE_S = 0.5     # ignore camera frames older than this when confirming
+
+# --- Ramp speed boost (accelerometer) tunable ---
+ACCEL_SPEED_BOOST_MULTIPLIER = 1.5   # +50% speed while accel_speed_boost.py reports boosted
+
+LOOP_HZ = 80
+LOOP_SLEEP = 1.0 / LOOP_HZ
+
+
+def vote_green_side(cam_watcher, first_side, duration_s):
+    """While the robot is stopped, keep reading the camera for duration_s and
+    take a majority vote of left/right. Readings where the black line was
+    actually found (line_x not None) count; if none had a line, all readings
+    count. Falls back to first_side if nothing is seen at all."""
+    with_line = {"left": 0, "right": 0}
+    no_line = {"left": 0, "right": 0}
+    end = time.monotonic() + duration_s
+    last_seen = None
+    while time.monotonic() < end:
+        side, seen_at = cam_watcher.get_green()
+        if side is not None and seen_at != last_seen:   # only count NEW frames
+            last_seen = seen_at
+            _gx, lx = cam_watcher.get_green_debug()
+            (with_line if lx is not None else no_line)[side] += 1
+        time.sleep(0.02)
+    votes = with_line if sum(with_line.values()) > 0 else no_line
+    if sum(votes.values()) == 0:
+        return first_side, votes
+    return ("right" if votes["right"] > votes["left"] else "left"), votes
+
+
+def read_vals(h):
+    return [lgpio.gpio_read(h, p) for p in SENSOR_PINS]   # 1 = black
+
+
+def corner_side(vals):
+    """+1 / -1 (same sign convention as the PID error) if this reading looks
+    like a sharp corner -- half the array black off one end -- else None."""
+    if sum(vals) < CORNER_MIN_BLACK or len(_runs(vals)) != 1:
+        return None   # too few black, or two separate lines (e.g. U-turn hairpin)
+    if vals[0] and not vals[-1]:
+        end_weight = WEIGHTS[0]
+    elif vals[-1] and not vals[0]:
+        end_weight = WEIGHTS[-1]
+    else:
+        return None   # both ends black (T / cross) or neither
+    return 1 if LINE_SIGN * end_weight > 0 else -1
+
+
+def run_corner(h, motors, side):
+    """Drive forward so the wheels reach the corner, then pivot toward `side`
+    until the middle sensors sit on the new line (and it crosses the array,
+    i.e. only a few sensors black)."""
+    print(f"corner -> {'+' if side > 0 else '-'} side")
+    motors.set_speeds(CORNER_FORWARD_SPEED, CORNER_FORWARD_SPEED)
+    time.sleep(CORNER_FORWARD_S)
+
+    if side > 0:
+        motors.set_speeds(CORNER_PIVOT_SPEED, -CORNER_PIVOT_SPEED)
+    else:
+        motors.set_speeds(-CORNER_PIVOT_SPEED, CORNER_PIVOT_SPEED)
+
+    start = time.monotonic()
+    while time.monotonic() - start < CORNER_PIVOT_TIMEOUT_S:
+        vals = read_vals(h)
+        mid = len(vals) // 2
+        on_line = (vals[mid - 1] or vals[mid]) and sum(vals) <= 3
+        if on_line and time.monotonic() - start >= CORNER_PIVOT_MIN_S:
+            break
+        time.sleep(0.005)
+
+
+def _runs(vals):
+    """Split the 8 readings into groups of neighbouring black sensors.
+    Returns a list of index lists, e.g. [[1,2],[5,6]] for two separate lines."""
+    runs, cur = [], []
+    for i, v in enumerate(vals):
+        if v:
+            cur.append(i)
+        elif cur:
+            runs.append(cur); cur = []
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def read_line_error(vals, last_error):
+    """Returns (error, n_black) from the 8-sensor array.
+    error ~ -3.5..+3.5 = where the line is; n_black == 0 means the line is
+    lost (the main loop then turns the last turning direction);
+    None at a junction (caller drives straight and keeps last_error).
+
+    If the array sees MORE THAN ONE separate line (e.g. both legs of a U-turn
+    hairpin, or a nearby crossing), it follows only the group closest to
+    where the line was last time instead of averaging them together."""
+    runs = _runs(vals)
+    n = sum(len(r) for r in runs)
+
+    if n == 0:
+        # All white = line lost. Always keep turning toward the side the line
+        # was last seen on, until it's found again. (Only if it was seen dead
+        # centre, with no side at all, does it drive straight.)
+        return 0.0, 0         # lost -- the main loop handles it (turns the last turning direction)
+
+    if max(len(r) for r in runs) >= JUNCTION_MIN_BLACK:
+        return None, n
+
+    run_errors = [LINE_SIGN * sum(WEIGHTS[i] for i in r) / len(r) for r in runs]
+    if len(run_errors) == 1:
+        return run_errors[0], n
+    ref = max(-3.5, min(3.5, last_error))          # where the line was last time
+    return min(run_errors, key=lambda e: abs(e - ref)), n
+
+
+def turn_speed_scale(error):
+    """Slow down in sharp turns: full BASE_SPEED while the line is near the
+    middle, dropping to MIN_SPEED_FRAC of it when the line is at the edge of
+    the array or lost -- so tight bends (U-turn hairpins) become near-pivots."""
+    if error is None:
+        return 1.0
+    e = abs(error)
+    if e <= SLOWDOWN_START_ERR:
+        return 1.0
+    if e >= SLOWDOWN_FULL_ERR:
+        return MIN_SPEED_FRAC
+    t = (e - SLOWDOWN_START_ERR) / (SLOWDOWN_FULL_ERR - SLOWDOWN_START_ERR)
+    return 1.0 - t * (1.0 - MIN_SPEED_FRAC)
+
+
+def main():
+    h = lgpio.gpiochip_open(0)
+    lgpio.gpio_claim_output(h, EN_PIN, 1)   # EN HIGH -- enable the sensor array before we try reading it
+    # Internal pull-up on all 8 sensor pins -- confirmed working in
+    # sensor_tests/test_line.py. WHITE -> LOW (0), BLACK -> HIGH (1).
+    for pin in SENSOR_PINS:
+        lgpio.gpio_claim_input(h, pin, lgpio.SET_PULL_UP)
+
+    motors = BLDCMotorDriver()
+
+    cam_servo = None
+    if SET_CAMERA_ANGLE:
+        cam_servo = CameraServo()
+        cam_servo.look_at_line()     # held for the whole run
+
+    cam_watcher = CameraWatcher()
+    cam_watcher.start()
+
+    tof_detector = ToFDetector()
+    if USE_TOF:
+        tof_detector.start()
+
+    accel_boost = AccelSpeedBoost()
+    accel_boost.start()
+
+    handled_seen_at = 0.0
+    turn_until = 0.0
+    turn_side = None
+    cooldown_until = 0.0
+    obstacle_cooldown_until = 0.0
+
+    last_error = 0.0
+    straight_since = time.monotonic()
+    was_lost = False
+    last_turn_dir = None     # last real turn: "left" / "right" (STRAIGHT never overwrites it)
+    current_dir = "straight" # what it is doing right now (printed when it changes)
+
+    print(f"[version: lost-line -> spin on the spot toward last LEFT/RIGHT turn, LOOP_HZ={LOOP_HZ}]")
+    print("Starting PID line follow with green marker turns and obstacle evasion (no endzone). Ctrl-C to stop.")
+    try:
+        while True:
+            now = time.monotonic()
+
+            # --- ToF within range: confirm with the camera before evading ---
+            # (the ToF alone can't tell a ramp from an actual obstacle)
+            if USE_TOF and now >= obstacle_cooldown_until:
+                distance_mm, seen_at = tof_detector.get_latest()
+                fresh = distance_mm is not None and (now - seen_at) <= OBSTACLE_STALE_S
+                if fresh and distance_mm <= OBSTACLE_TRIGGER_MM:
+                    motors.stop()
+                    # Raise the camera so it actually looks AT the obstacle, not the floor.
+                    obs_servo = CameraServo()
+                    obs_servo.look_up()
+                    time.sleep(OBSTACLE_CAMERA_SETTLE_S)
+                    frame, frame_seen_at = cam_watcher.get_frame()
+                    frame_fresh = frame is not None and (time.monotonic() - frame_seen_at) <= OBSTACLE_FRAME_STALE_S
+                    bottle = frame_fresh and is_bottle(frame)
+                    # Put the camera back to the line-following angle and let the servo go.
+                    obs_servo.look_at_line()
+                    obs_servo.release()
+
+                    if bottle:
+                        run_evade_sequence(motors)
+                    else:
+                        print("ToF triggered but camera didn't confirm a bottle -- treating as ramp")
+
+                    obstacle_cooldown_until = time.monotonic() + OBSTACLE_COOLDOWN_S
+                    last_error = 0.0
+                    continue
+
+            # --- Currently mid-turn: ignore line sensors entirely ---
+            if turn_until > 0.0:
+                if now < turn_until:
+                    if (turn_side == "right") != GREEN_SWAP_TURN:
+                        motors.set_speeds(GREEN_TURN_SPEED, -GREEN_TURN_SPEED)
+                    else:
+                        motors.set_speeds(-GREEN_TURN_SPEED, GREEN_TURN_SPEED)
+                    time.sleep(LOOP_SLEEP)
+                    continue
+                else:
+                    turn_until = 0.0
+                    turn_side = None
+                    cooldown_until = now + GREEN_COOLDOWN_S
+                    last_error = 0.0
+
+            if now >= cooldown_until:
+                side, seen_at = cam_watcher.get_green()
+                if side is not None and seen_at != handled_seen_at:
+                    handled_seen_at = seen_at
+                    gx, lx = cam_watcher.get_green_debug()
+                    print(f"GREEN seen on the {side} (green_x={gx}, line_x={lx}) -- stopping to confirm...")
+                    motors.stop()
+                    # Use the stop time to look again and take a majority vote,
+                    # so one bad frame can't send it the wrong way.
+                    side, votes = vote_green_side(cam_watcher, side, GREEN_STOP_S)
+                    print(f"GREEN confirmed: {side} (votes left={votes['left']} right={votes['right']}) -- forward {GREEN_FORWARD_S}s, then turning {side}")
+                    motors.set_speeds(GREEN_FORWARD_SPEED, GREEN_FORWARD_SPEED)
+                    time.sleep(GREEN_FORWARD_S)
+                    turn_side = side
+                    turn_until = time.monotonic() + GREEN_TURN_DURATION_S
+                    continue
+
+            vals = read_vals(h)
+
+            # Sharp corner straight after a long straight: drive up to it, then pivot.
+            if CORNER_ENABLED and time.monotonic() - straight_since >= CORNER_MIN_STRAIGHT_S:
+                side = corner_side(vals)
+                if side is not None:
+                    run_corner(h, motors, side)
+                    last_error = 0.0
+                    straight_since = time.monotonic()
+                    continue
+
+            error, _n_black = read_line_error(vals, last_error)
+            lost_now = _n_black == 0
+
+            if lost_now and not was_lost:
+                if last_turn_dir:
+                    how = ("it was going STRAIGHT, so looked back -> last real turn was "
+                           if current_dir == "straight" else "last turn was ")
+                    print(f"LINE LOST -> {how}{last_turn_dir.upper()} -> spinning {last_turn_dir.upper()} on the spot until the line is seen")
+                else:
+                    print("LINE LOST -> no LEFT/RIGHT turn recorded yet -> creeping straight forward")
+            elif was_lost and not lost_now:
+                print("LINE FOUND again")
+            was_lost = lost_now
+
+            if lost_now:
+                # No PID while lost: spin ON THE SPOT toward the last real turn
+                if last_turn_dir == "right":
+                    motors.set_speeds(LOST_TURN_SPEED, -LOST_TURN_SPEED)
+                elif last_turn_dir == "left":
+                    motors.set_speeds(-LOST_TURN_SPEED, LOST_TURN_SPEED)
+                else:
+                    motors.set_speeds(10.0, 10.0)   # nothing recorded yet: creep forward to find a line
+                time.sleep(LOOP_SLEEP)
+                continue
+
+            if error is None:          # junction: straight, keep memory
+                correction = 0.0
+            else:
+                correction = Kp * error + Kd * (error - last_error)
+                last_error = error
+                # What is the robot doing right now: LEFT, RIGHT or STRAIGHT?
+                if correction >= TURN_DIR_MIN_CORRECTION:
+                    now_dir = "right"
+                elif correction <= -TURN_DIR_MIN_CORRECTION:
+                    now_dir = "left"
+                else:
+                    now_dir = "straight"
+                if now_dir != current_dir:
+                    print(f"TURN: {now_dir.upper()}")
+                    current_dir = now_dir
+                # If it's STRAIGHT, keep the previous LEFT/RIGHT -- i.e. look back
+                # through the history to the last real turn.
+                if now_dir != "straight":
+                    last_turn_dir = now_dir
+
+            if error is None or abs(error) > 1.0:
+                straight_since = time.monotonic()   # not driving straight
+
+            is_boosted, _accel_y = accel_boost.get_boost()
+            base_speed = BASE_SPEED * ACCEL_SPEED_BOOST_MULTIPLIER if is_boosted else BASE_SPEED
+            base_speed *= turn_speed_scale(error)
+
+            left_speed = base_speed + correction
+            right_speed = base_speed - correction
+            motors.set_speeds(left_speed, right_speed)
+
+            time.sleep(LOOP_SLEEP)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        motors.stop()
+        if cam_servo is not None:
+            cam_servo.close()
+        cam_watcher.stop()
+        tof_detector.stop()
+        accel_boost.stop()
+        lgpio.gpio_write(h, EN_PIN, 0)   # EN LOW -- power the sensor array back down on exit
+        lgpio.gpiochip_close(h)
+
+
+if __name__ == "__main__":
+    main()

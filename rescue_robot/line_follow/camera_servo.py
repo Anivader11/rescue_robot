@@ -1,0 +1,77 @@
+"""
+camera_servo.py
+==================
+Controls the 9g camera-pan servo using gpiozero's Servo class -- this is
+the approach confirmed working on the robot (see test_servo.py), so the
+real code now matches it instead of driving lgpio.tx_servo() directly.
+
+servo.value runs from -1 to +1, mapped linearly across this servo's full
+0-270 degree range:
+    -1  -> 0 degrees
+     0  -> 135 degrees
+    +1  -> 270 degrees
+"""
+
+from gpiozero import Servo
+import time
+
+SERVO_PIN = 19
+
+MOVE_SETTLE_S = 0.3   # how long to wait after a move before considering it "done"
+
+# Calibration (test_camera_servo.py): value 0 = arm horizontal = camera looking
+# STRAIGHT DOWN; value 0.75 = arm raised 90 deg (camera looking straight ahead).
+# Linear in between: ~120 deg per 1.0, i.e. value = degrees_raised / 120.
+DEGREES_PER_UNIT = 90 / 0.75
+
+FORWARD_VALUE = 0.0      # arm horizontal, camera straight down (rest position)
+LINE_VALUE = 0.30        # arm raised ~36 deg -> camera ~54 deg below horizontal: line following + green squares
+LOOK_UP_VALUE = 1.0      # evacuation zone: camera as far up as the servo goes (+-1 is the hard limit), looking across the zone
+
+class CameraServo:
+    def __init__(self, pin=SERVO_PIN):
+        # initial_value=None: send NO pulse until we ask for a position, so creating
+        # the servo doesn't yank the camera away from where it was set by hand.
+        self._servo = Servo(pin, initial_value=None, min_pulse_width=0.0005, max_pulse_width=0.0025)
+
+    def set_value(self, value):
+        """value: -1 (0 deg) to +1 (270 deg), 0 = 135 deg (straight ahead)."""
+        value = max(-1.0, min(1.0, value))
+        self._servo.value = value
+        time.sleep(MOVE_SETTLE_S)
+
+    def look_forward(self):
+        self.set_value(FORWARD_VALUE)
+
+    def look_up(self):
+        self.set_value(LOOK_UP_VALUE)
+
+    def look_at_line(self):
+        self.set_value(LINE_VALUE)
+
+    def raise_degrees(self, deg):
+        """Raise the arm `deg` degrees above horizontal (0 = straight down)."""
+        self.set_value(deg / DEGREES_PER_UNIT)
+
+    def release(self):
+        self._servo.detach()
+
+    def close(self):
+        self._servo.close()   # frees GPIO19 so another CameraServo can claim it
+
+
+if __name__ == "__main__":
+    cam = CameraServo()
+    try:
+        while True:
+            print("Looking forward...")
+            cam.look_forward()
+            time.sleep(1)
+
+            print("Looking up...")
+            cam.look_up()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        cam.close()

@@ -1,0 +1,193 @@
+"""
+pid_line_follow_only.py
+==========================
+Bare-bones PID black line following -- ONLY the line following part, no
+camera, no ToF obstacle evasion, no IMU ramp boost. Useful for testing/
+tuning the core line-following behaviour on its own, or as a simpler
+starting point to build back up from.
+
+Sensor power: the line sensor board has an EN (enable) pin -- BCM22 --
+that must be driven HIGH before the OUT pins will report anything
+real. Without this, the sensors are simply unpowered.
+
+Sensor pins are claimed with an internal pull-up (lgpio.SET_PULL_UP) --
+this is the exact setup confirmed working in sensor_tests/test_line.py.
+WHITE -> LOW (0), BLACK -> HIGH (1).
+
+Sensors: all 8 outputs of the Parallax #28034 array are read (see
+SENSOR_PINS). The line's position is the average weight of the sensors
+on black (-3.5..+3.5) and feeds the PID. All 8 white = line lost: if it
+was last seen off to one side the robot keeps turning that way (turn
+memory); if it was last near the middle it's treated as a gap and the
+robot drives straight. 6+ sensors on black = junction -> straight.
+
+Usage:
+    python3 line_follow/pid_line_follow_only.py
+"""
+
+import time
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import lgpio
+from control.motors import BLDCMotorDriver
+
+EN_PIN = 22      # line sensor array's enable line -- must be driven HIGH or the sensors don't power up at all
+
+# --- 8-sensor array (Parallax #28034), wiring confirmed with sensor_tests/test_line8.py ---
+#              OUT0 OUT1 OUT2 OUT3 OUT4 OUT5 OUT6 OUT7
+SENSOR_PINS = [5,   6,   24,  16,  17,  23,  25,  26]
+
+# Position weight per sensor. Sign chosen to match the old, confirmed-working
+# 2-sensor code: OUT2 (old left pin, BCM24) on black gave a POSITIVE error,
+# OUT5 (old right pin, BCM23) a NEGATIVE one -- so the OUT0 end is positive.
+# If the robot steers AWAY from the line, flip LINE_SIGN to -1.
+LINE_SIGN = 1
+WEIGHTS = [3.5, 2.5, 1.5, 0.5, -0.5, -1.5, -2.5, -3.5]
+
+LOST_ERROR = 4.5           # error used when all 8 read white after the line was seen off to one side
+LOST_STRAIGHT_BELOW = 1.0  # ...but if the line was last near the middle (a gap), just go straight
+LOST_TURN_OPPOSITE = True  # line lost after a right correction -> turn LEFT (and vice versa)
+JUNCTION_MIN_BLACK = 6     # this many+ sensors on black = junction / wide black -> go straight
+
+# --- Sharp 90-degree corner straight after a long straight -------------------
+# (e.g. the top-right corner of the double-corner tile, where the robot used to
+# spin on the spot 5 cm short of the corner and U-turn back down the line).
+# Only fires when the robot HAD been driving straight for CORNER_MIN_STRAIGHT_S
+# and then half the array suddenly goes black on ONE side. Everything else
+# (curves, corners that come straight after another turn) is normal PID.
+CORNER_ENABLED = True
+CORNER_MIN_STRAIGHT_S = 0.4   # must have been straight (|error| <= 1) this long first
+CORNER_MIN_BLACK = 4          # 4+ black incl. one END sensor (other end white) = corner
+CORNER_FORWARD_SPEED = 30.0
+CORNER_FORWARD_S = 0.25       # TUNE: drive on this long so the wheels reach the corner (~5 cm)
+CORNER_PIVOT_SPEED = 45.0
+CORNER_PIVOT_MIN_S = 0.1
+CORNER_PIVOT_TIMEOUT_S = 2.0
+
+BASE_SPEED = 30.0
+Kp = 50.0   # error now -3.5..+3.5 (was -1/0/+1): line at edge = 52, lost = 67 correction
+Kd = 15.0
+
+LOOP_HZ = 50
+LOOP_SLEEP = 1.0 / LOOP_HZ
+
+
+def read_vals(h):
+    return [lgpio.gpio_read(h, p) for p in SENSOR_PINS]   # 1 = black
+
+
+def corner_side(vals):
+    """+1 / -1 (same sign convention as the PID error) if this reading looks
+    like a sharp corner -- half the array black off one end -- else None."""
+    if sum(vals) < CORNER_MIN_BLACK:
+        return None
+    if vals[0] and not vals[-1]:
+        end_weight = WEIGHTS[0]
+    elif vals[-1] and not vals[0]:
+        end_weight = WEIGHTS[-1]
+    else:
+        return None   # both ends black (T / cross) or neither
+    return 1 if LINE_SIGN * end_weight > 0 else -1
+
+
+def run_corner(h, motors, side):
+    """Drive forward so the wheels reach the corner, then pivot toward `side`
+    until the middle sensors sit on the new line (and it crosses the array,
+    i.e. only a few sensors black)."""
+    print(f"corner -> {'+' if side > 0 else '-'} side")
+    motors.set_speeds(CORNER_FORWARD_SPEED, CORNER_FORWARD_SPEED)
+    time.sleep(CORNER_FORWARD_S)
+
+    if side > 0:
+        motors.set_speeds(CORNER_PIVOT_SPEED, -CORNER_PIVOT_SPEED)
+    else:
+        motors.set_speeds(-CORNER_PIVOT_SPEED, CORNER_PIVOT_SPEED)
+
+    start = time.monotonic()
+    while time.monotonic() - start < CORNER_PIVOT_TIMEOUT_S:
+        vals = read_vals(h)
+        mid = len(vals) // 2
+        on_line = (vals[mid - 1] or vals[mid]) and sum(vals) <= 3
+        if on_line and time.monotonic() - start >= CORNER_PIVOT_MIN_S:
+            break
+        time.sleep(0.005)
+
+
+def read_line_error(vals, last_error):
+    """Returns (error, n_black) from the 8-sensor array.
+    error ~ -3.5..+3.5 = where the line is; +-LOST_ERROR when the line was
+    lost off one side (keeps turning toward where it was last seen);
+    None at a junction (caller drives straight and keeps last_error)."""
+    black = [w for w, v in zip(WEIGHTS, vals) if v]
+    n = len(black)
+
+    if n == 0:
+        # All white. Line last seen off to a side -> we swung past it, keep turning.
+        # Line last seen near the middle -> it's a gap, go straight.
+        if abs(last_error) < LOST_STRAIGHT_BELOW:
+            return 0.0, 0
+        side = 1 if last_error > 0 else -1
+        if LOST_TURN_OPPOSITE:
+            side = -side          # turn the OPPOSITE way to the last correction
+        return side * LOST_ERROR, 0
+
+    if n >= JUNCTION_MIN_BLACK:
+        return None, n
+
+    return LINE_SIGN * sum(black) / n, n
+
+
+def main():
+    h = lgpio.gpiochip_open(0)
+    lgpio.gpio_claim_output(h, EN_PIN, 1)   # EN HIGH -- enable the sensor array before we try reading it
+    # Internal pull-up on all 8 sensor pins -- confirmed working in
+    # sensor_tests/test_line.py. WHITE -> LOW (0), BLACK -> HIGH (1).
+    for pin in SENSOR_PINS:
+        lgpio.gpio_claim_input(h, pin, lgpio.SET_PULL_UP)
+
+    motors = BLDCMotorDriver()
+
+    last_error = 0.0
+    straight_since = time.monotonic()
+
+    print("Starting plain PID line following. Ctrl-C to stop.")
+    try:
+        while True:
+            vals = read_vals(h)
+
+            # Sharp corner straight after a long straight: drive up to it, then pivot.
+            if CORNER_ENABLED and time.monotonic() - straight_since >= CORNER_MIN_STRAIGHT_S:
+                side = corner_side(vals)
+                if side is not None:
+                    run_corner(h, motors, side)
+                    last_error = 0.0
+                    straight_since = time.monotonic()
+                    continue
+
+            error, _n_black = read_line_error(vals, last_error)
+            if error is None:          # junction: straight, keep memory
+                correction = 0.0
+            else:
+                correction = Kp * error + Kd * (error - last_error)
+                last_error = error
+
+            if error is None or abs(error) > 1.0:
+                straight_since = time.monotonic()   # not driving straight
+
+            left_speed = BASE_SPEED + correction
+            right_speed = BASE_SPEED - correction
+            motors.set_speeds(left_speed, right_speed)
+
+            time.sleep(LOOP_SLEEP)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        motors.stop()
+        lgpio.gpio_write(h, EN_PIN, 0)   # EN LOW -- power the sensor array back down on exit
+        lgpio.gpiochip_close(h)
+
+
+if __name__ == "__main__":
+    main()

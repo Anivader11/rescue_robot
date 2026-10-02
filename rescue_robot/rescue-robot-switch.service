@@ -1,0 +1,33 @@
+# rescue-robot-switch.service -- runs switch_watcher.py at boot.
+#
+# Install on the Pi:
+#   sudo cp ~/rescue_robot/rescue-robot-switch.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now rescue-robot-switch.service
+# Logs:
+#   journalctl -u rescue-robot-switch.service -f      (watcher)
+#   ls ~/rescue_robot/logs/                           (each run's output)
+#
+# PYTHON: uses the venv in ~/rescue_robot/.venv -- running the venv's
+# python3 directly is the same as `source .venv/bin/activate` first.
+# If your venv folder has a different name (e.g. venv), change it below.
+
+[Unit]
+Description=Rescue robot switch watcher (GPIO14/15 button toggles pid_line_follow_no_endzone.py)
+After=multi-user.target
+
+[Service]
+Type=simple
+User=nigesh
+WorkingDirectory=/home/nigesh/rescue_robot
+ExecStart=/home/nigesh/rescue_robot/.venv/bin/python3 -u /home/nigesh/rescue_robot/switch_watcher.py
+Environment=PYTHONUNBUFFERED=1
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=2
+# gpio + i2c for sensors/motors, video for the camera
+SupplementaryGroups=gpio i2c video
+
+[Install]
+WantedBy=multi-user.target
